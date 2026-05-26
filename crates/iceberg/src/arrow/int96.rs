@@ -71,16 +71,16 @@ impl<'a> Int96CoercionVisitor<'a> {
         }
     }
 
-    /// Determine the target TimeUnit for a Timestamp(Nanosecond) field based on the
-    /// Iceberg schema. Falls back to microsecond when field IDs are unavailable,
-    /// matching Iceberg Java behavior.
+    /// Determine the target TimeUnit for a timestamp field based on the Iceberg schema.
+    /// Handles INT96 (Nanosecond), TIMESTAMP_MILLIS (Millisecond), and TIMESTAMP_SECONDS (Second)
+    /// by coercing them to the resolution indicated by the Iceberg schema.
+    /// Falls back to microsecond when field IDs are unavailable, matching Iceberg Java behavior.
     fn target_unit(&self, field: &FieldRef) -> Option<TimeUnit> {
-        if !matches!(
-            field.data_type(),
-            DataType::Timestamp(TimeUnit::Nanosecond, _)
-        ) {
-            return None;
-        }
+        let source_unit = match field.data_type() {
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => TimeUnit::Nanosecond,
+            DataType::Timestamp(TimeUnit::Millisecond, _) => TimeUnit::Millisecond,
+            _ => return None,
+        };
 
         let target = field
             .metadata()
@@ -99,7 +99,7 @@ impl<'a> Int96CoercionVisitor<'a> {
             // Iceberg Java reads INT96 as microseconds by default
             .unwrap_or(TimeUnit::Microsecond);
 
-        if target == TimeUnit::Nanosecond {
+        if target == source_unit {
             None
         } else {
             Some(target)
@@ -574,4 +574,24 @@ mod tests {
         };
         assert_eq!(value_dt, DataType::Timestamp(TimeUnit::Microsecond, None));
     }
+
+    #[test]
+    fn test_coerce_millisecond_to_microsecond() {
+        let iceberg = iceberg_schema_with_timestamp();
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("ts", DataType::Timestamp(TimeUnit::Millisecond, None), true)
+                .with_metadata(field_id_meta(1)),
+            Field::new("id", DataType::Int32, false).with_metadata(field_id_meta(2)),
+        ]));
+
+        let coerced = coerce_int96_timestamps(&arrow_schema, &iceberg).unwrap();
+        assert_eq!(
+            coerced.field(0).data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, None),
+            "Timestamp(Millisecond, None) should be coerced to Timestamp(Microsecond, None)"
+        );
+        assert_eq!(coerced.field(1).data_type(), &DataType::Int32);
+    }
+
 }

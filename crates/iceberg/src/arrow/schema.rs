@@ -461,6 +461,9 @@ impl ArrowSchemaVisitor for ArrowSchemaConverter {
             DataType::Timestamp(unit, None) if unit == &TimeUnit::Nanosecond => {
                 Ok(Type::Primitive(PrimitiveType::TimestampNs))
             }
+            DataType::Timestamp(unit, None) if unit == &TimeUnit::Millisecond => {
+                Ok(Type::Primitive(PrimitiveType::Timestamp))
+            }
             DataType::Timestamp(unit, Some(zone))
                 if unit == &TimeUnit::Microsecond
                     && (zone.as_ref() == "UTC" || zone.as_ref() == "+00:00") =>
@@ -472,6 +475,12 @@ impl ArrowSchemaVisitor for ArrowSchemaConverter {
                     && (zone.as_ref() == "UTC" || zone.as_ref() == "+00:00") =>
             {
                 Ok(Type::Primitive(PrimitiveType::TimestamptzNs))
+            }
+            DataType::Timestamp(unit, Some(zone))
+                if unit == &TimeUnit::Millisecond
+                    && (zone.as_ref() == "UTC" || zone.as_ref() == "+00:00") =>
+            {
+                Ok(Type::Primitive(PrimitiveType::Timestamptz))
             }
             DataType::Binary | DataType::LargeBinary | DataType::BinaryView => {
                 Ok(Type::Primitive(PrimitiveType::Binary))
@@ -2327,4 +2336,83 @@ mod tests {
         pretty_assertions::assert_eq!(schema, expected);
         assert_eq!(schema.highest_field_id(), 17);
     }
+
+    #[test]
+    fn test_arrow_schema_to_schema_timestamp_millisecond() {
+        let arrow_schema = ArrowSchema::new(vec![
+            Field::new("ts", DataType::Timestamp(TimeUnit::Millisecond, None), true).with_metadata(
+                HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())]),
+            ),
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "2".to_string(),
+            )])),
+        ]);
+
+        let schema = arrow_schema_to_schema(&arrow_schema).unwrap();
+        let ts_field = schema.field_by_id(1).unwrap();
+        assert_eq!(
+            *ts_field.field_type,
+            Type::Primitive(PrimitiveType::Timestamp),
+            "Timestamp(Millisecond, None) should map to Iceberg Timestamp"
+        );
+    }
+
+    #[test]
+    fn test_arrow_schema_to_schema_timestamp_millisecond_utc() {
+        let arrow_schema = ArrowSchema::new(vec![
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+                false,
+            )
+            .with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]);
+
+        let schema = arrow_schema_to_schema(&arrow_schema).unwrap();
+        let ts_field = schema.field_by_id(1).unwrap();
+        assert_eq!(
+            *ts_field.field_type,
+            Type::Primitive(PrimitiveType::Timestamptz),
+            "Timestamp(Millisecond, Some(\"UTC\")) should map to Iceberg Timestamptz"
+        );
+    }
+
+    #[test]
+    fn test_arrow_schema_to_schema_timestamp_millisecond_offset() {
+        let arrow_schema = ArrowSchema::new(vec![
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Millisecond, Some("+00:00".into())),
+                false,
+            )
+            .with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]);
+
+        let schema = arrow_schema_to_schema(&arrow_schema).unwrap();
+        let ts_field = schema.field_by_id(1).unwrap();
+        assert_eq!(
+            *ts_field.field_type,
+            Type::Primitive(PrimitiveType::Timestamptz),
+            "Timestamp(Millisecond, Some(\"+00:00\")) should map to Iceberg Timestamptz"
+        );
+    }
+
+    #[test]
+    fn test_type_conversion_timestamp_millisecond() {
+        let arrow_type = DataType::Timestamp(TimeUnit::Millisecond, None);
+        let iceberg_type = arrow_type_to_type(&arrow_type).unwrap();
+        assert_eq!(
+            iceberg_type,
+            Type::Primitive(PrimitiveType::Timestamp),
+            "arrow_type_to_type should accept Timestamp(Millisecond, None)"
+        );
+    }
+
 }
