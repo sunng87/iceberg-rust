@@ -182,21 +182,17 @@ impl FileScanTaskReader {
 
         // Coerce INT96 timestamp columns to the resolution specified by the Iceberg schema.
         // This must happen before building the stream reader to avoid i64 overflow in arrow-rs.
+        // arrow-rs only supports schema hints for INT96→Nanosecond coercion. For other
+        // resolution mismatches (e.g. TIMESTAMP_MILLIS), fall back to the original schema
+        // and let RecordBatchTransformer cast the columns after reading.
         let arrow_metadata = if let Some(coerced_schema) =
             coerce_int96_timestamps(arrow_metadata.schema(), &task.schema)
         {
             let options = ArrowReaderOptions::new().with_schema(Arc::clone(&coerced_schema));
-            ArrowReaderMetadata::try_new(Arc::clone(arrow_metadata.metadata()), options).map_err(
-                |e| {
-                    Error::new(
-                        ErrorKind::Unexpected,
-                        format!(
-                            "Failed to create ArrowReaderMetadata with INT96-coerced schema: {coerced_schema}"
-                        ),
-                    )
-                    .with_source(e)
-                },
-            )?
+            match ArrowReaderMetadata::try_new(Arc::clone(arrow_metadata.metadata()), options) {
+                Ok(meta) => meta,
+                Err(_) => arrow_metadata,
+            }
         } else {
             arrow_metadata
         };
@@ -1189,5 +1185,82 @@ mod tests {
             "INT96 in map: got {}, expected {expected_micros}",
             ts_array.value(0)
         );
+    }
+
+    #[tokio::test]
+    async fn test_read_timestamp_millis_parquet_file() {
+        use arrow_array::{Int32Array, TimestampMillisecondArray};
+        use arrow_schema::TimeUnit;
+        use parquet::file::properties::WriterProperties;
+
+        let tmp_dir = TempDir::new().unwrap();
+        let table_location = tmp_dir.path().to_str().unwrap().to_string();
+        let file_path = format!("{table_location}/ts_millis.parquet");
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("ts", DataType::Timestamp(TimeUnit::Millisecond, None), true)
+                .with_metadata(HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())])),
+            Field::new("id", DataType::Int32, false)
+                .with_metadata(HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "2".to_string())])),
+        ]));
+
+        let ts_values = TimestampMillisecondArray::from(vec![
+            Some(1_700_000_000_000_i64),
+            Some(1_700_000_001_000_i64),
+            None,
+        ]);
+        let id_values = Int32Array::from(vec![1, 2, 3]);
+
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(ts_values) as ArrayRef,
+                Arc::new(id_values) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let props = WriterProperties::builder().build();
+        let file = File::create(&file_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, arrow_schema.clone(), Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::optional(1, "ts", Type::Primitive(PrimitiveType::Timestamp))
+                        .into(),
+                    NestedField::required(2, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let batches = read_int96_batches(&file_path, schema, vec![1, 2]).await;
+        assert_eq!(batches.len(), 1);
+
+        let ts_col = batches[0].column(0);
+        assert_eq!(
+            ts_col.data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, None),
+            "Column should be cast from Millisecond to Microsecond"
+        );
+
+        use arrow_array::TimestampMicrosecondArray;
+        let ts_array = ts_col
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(ts_array.value(0), 1_700_000_000_000_000_i64);
+        assert_eq!(ts_array.value(1), 1_700_000_001_000_000_i64);
+        assert!(ts_array.is_null(2));
+
+        let id_col = batches[0].column(1);
+        let id_array = id_col.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(id_array.value(0), 1);
+        assert_eq!(id_array.value(1), 2);
+        assert_eq!(id_array.value(2), 3);
     }
 }
