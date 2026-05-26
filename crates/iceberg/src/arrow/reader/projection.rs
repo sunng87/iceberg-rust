@@ -106,6 +106,14 @@ impl ArrowReader {
                 ) if requested_precision >= file_precision && file_scale == requested_scale => true,
                 // Uuid will be store as Fixed(16) in parquet file, so the read back type will be Fixed(16).
                 (Some(PrimitiveType::Fixed(16)), Some(PrimitiveType::Uuid)) => true,
+                // Parquet TIMESTAMP_MILLIS has no timezone info. Many writers (e.g. GreptimeDB)
+                // store UTC timestamps as Timestamp(Millisecond, None), which maps to Iceberg
+                // Timestamp. Allow cross-promotion with Timestamptz so these columns are not
+                // excluded from the projection mask.
+                (Some(PrimitiveType::Timestamp), Some(PrimitiveType::Timestamptz)) => true,
+                (Some(PrimitiveType::Timestamptz), Some(PrimitiveType::Timestamp)) => true,
+                (Some(PrimitiveType::TimestampNs), Some(PrimitiveType::TimestamptzNs)) => true,
+                (Some(PrimitiveType::TimestamptzNs), Some(PrimitiveType::TimestampNs)) => true,
                 _ => false,
             }
         }
